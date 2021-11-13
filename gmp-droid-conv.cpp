@@ -225,6 +225,7 @@ DroidColourConvert::GetConverter (DroidMediaCodecMetaData * md,
       converter = new ConvertYUV420SemiPlanar ();
       *conv_name = "ConvertYUV420SemiPlanar";
     } else {
+      printf(" --------------------- %d\n", md->hal_format);
       return nullptr;
     }
   }

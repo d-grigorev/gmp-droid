@@ -38,7 +38,7 @@ const char *kLogStrings[] = {
   "GMP-DROID Debug: "
 };
 
-static int g_log_level = INFO;
+static int g_log_level = DEBUG;
 
 #define LOG(l, x) do { \
         if (l >=0 && l <= g_log_level) { \
@@ -78,7 +78,7 @@ public:
     // Check if this device supports the codec we want
     memset (&m_metadata, 0x0, sizeof (m_metadata));
     m_metadata.parent.flags =
-        static_cast <DroidMediaCodecFlags> (DROID_MEDIA_CODEC_HW_ONLY | DROID_MEDIA_CODEC_NO_MEDIA_BUFFER);
+        static_cast <DroidMediaCodecFlags> (DROID_MEDIA_CODEC_HW_ONLY);// | DROID_MEDIA_CODEC_NO_MEDIA_BUFFER);
 
     switch (codecSettings.mCodecType) {
       case kGMPVideoCodecVP8:
@@ -319,11 +319,19 @@ public:
       droid_media_codec_set_callbacks (m_codec, &cb, this);
     }
 
-    {
+    m_buffer_queue = droid_media_codec_get_buffer_queue (m_codec);
+    if (m_buffer_queue) {
+      DroidMediaBufferQueueCallbacks cb;
+      cb.buffers_released = DroidVideoDecoder::BuffersReleased;
+      cb.buffer_created = DroidVideoDecoder::BufferCreated;
+      cb.frame_available = DroidVideoDecoder::FrameAvailable;
+      droid_media_buffer_queue_set_callbacks (m_buffer_queue, &cb, this);
+    } else {
       DroidMediaCodecDataCallbacks cb;
       cb.data_available = DroidVideoDecoder::DataAvailable;
       droid_media_codec_set_data_callbacks (m_codec, &cb, this);
     }
+
     // Reset state
     m_draining = false;
 
@@ -345,6 +353,7 @@ public:
     memset (&md, 0x0, sizeof (md));
     memset (&rect, 0x0, sizeof (rect));
     droid_media_codec_get_output_info (m_codec, &md, &rect);
+    rect.bottom -= 10;
     LOG (INFO,
         "ConfigureOutput: Configuring converter for stride:" << md.width
         << " slice-height: " << md.height << " top: " << rect.top
@@ -477,6 +486,101 @@ public:
     }
   }
 
+  void ProcessNativeBuffer_m (DroidMediaBuffer *buffer)
+  {
+    if (m_resetting || !m_callback || !m_host) {
+      LOG(INFO, "Discarding decoded frame received while resetting");
+      droid_media_buffer_release(buffer, NULL, 0);
+      return;
+    }
+
+    if (!m_conv) {
+      //ConfigureOutput (nullptr);
+    }
+
+    DroidMediaBufferYCbCr ycbcr;
+    if (!droid_media_buffer_lock_ycbcr(buffer, DROID_MEDIA_BUFFER_LOCK_READ, &ycbcr)) {
+      droid_media_buffer_release(buffer, NULL, 0);
+      return;
+    }
+
+    GMPVideoFrame *ftmp = nullptr;
+
+    // Create new I420 frame
+    GMPErr err = m_host->CreateFrame (kGMPI420VideoFrame, &ftmp);
+    if (err != GMPNoErr) {
+      LOG (ERROR, "Couldn't allocate empty I420 frame");
+      Error (err);
+      droid_media_buffer_release(buffer, NULL, 0);
+      return;
+    }
+    // Fill it with the converter
+    GMPVideoi420Frame *frame = static_cast <GMPVideoi420Frame *>(ftmp);
+    //err = m_conv->Convert (m_host, &ycbcr, frame);
+    if (err != GMPNoErr) {
+      LOG (ERROR, "Couldn't make decoded frame");
+      Error (err);
+      droid_media_buffer_release(buffer, NULL, 0);
+      return;
+    }
+
+    // Set timestamp
+    int64_t ts = droid_media_buffer_get_timestamp (buffer) / 1000;
+    frame->SetTimestamp (ts);
+
+    // Look up duration in our cache
+    uint64_t dur = 0;
+    std::map <int64_t, uint64_t>::iterator durIt = m_dur.find (ts);
+    if (durIt != m_dur.end ()) {
+      dur = durIt->second;
+      m_dur.erase (durIt);
+    }
+    frame->SetDuration (dur);
+
+    // Send the new frame back to Gecko
+    m_callback->Decoded (frame);
+    LOG (DEBUG, "ProcessFrame: Returning frame ts: " << ts << " dur: " << dur);
+    if (m_dur.size () == 0 && m_draining) {
+      // TODO: we never get the buffers down to 0 with the current SimpleDecodingSource, but EOS will do it
+      m_callback->DrainComplete ();
+      m_draining = false;
+    } else {
+      LOG (DEBUG, "Buffers still out " << m_dur.size ());
+    }
+    droid_media_buffer_release(buffer, NULL, 0);
+  }
+
+  bool ProcessNativeBuffer (DroidMediaBuffer *buffer)
+  {
+    if (buffer) {
+      m_codec_lock->Acquire ();
+
+      if (m_resetting || !m_callback || !m_host) {
+          LOG(INFO, "Discarding decoded frame received while resetting");
+          m_codec_lock->Release ();
+          return false;
+      }
+      m_processing = true;
+      m_codec_lock->Release ();
+
+      if (g_platform_api) {
+        g_platform_api->syncrunonmainthread (WrapTask (this,
+              &DroidVideoDecoder::ProcessNativeBuffer_m, buffer));
+      }
+
+      m_codec_lock->Acquire ();
+      m_processing = false;
+      // Reset() was called while processing. Run it on submit thread.
+      if (m_resetting && m_submit_thread) {
+        m_submit_thread->Post (WrapTask (this,
+                &DroidVideoDecoder::ResetCodec));
+      }
+      m_codec_lock->Release ();
+      return true;
+    }
+    return false;
+  }
+
 private:
   // Called on submit thread
   void ResetCodec ()
@@ -601,6 +705,24 @@ private:
     decoder->EOS ();
   }
 
+  static void
+  BuffersReleased (void *data)
+  {
+  }
+
+  static bool
+  BufferCreated (void *data, DroidMediaBuffer *buffer)
+  {
+    return true;
+  }
+
+  static bool
+  FrameAvailable (void *data, DroidMediaBuffer *buffer)
+  {
+    DroidVideoDecoder *decoder = (DroidVideoDecoder *) data;
+    return decoder->ProcessNativeBuffer (buffer);
+  }
+
   GMPVideoHost *m_host;
   GMPVideoDecoderCallback *m_callback = nullptr;
   GMPMutex *m_codec_lock = nullptr;
@@ -608,6 +730,7 @@ private:
   DroidMediaCodecDecoderMetaData m_metadata;
   DroidMediaCodec *m_codec = nullptr;
   DroidColourConvert *m_conv = nullptr;
+  DroidMediaBufferQueue *m_buffer_queue;
   bool m_dropConverter = false;
   bool m_draining = false;
   bool m_resetting = false;
